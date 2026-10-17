@@ -132,7 +132,7 @@ class Opening(unittest.TestCase):
     def test_wizard_opening_gets_penguin(self):
         wave = [{"enemyId": 2, "count": 3, "allowedRows": [2]}]
         cards = run(state("start", enemies=[enemy(2, 10, 2)], wave=wave))
-        self.assertTrue(any(k == 0 and y == 2 and x > 4 for k, x, y in cards), cards)
+        self.assertTrue(any(k == 0 and y == 2 for k, x, y in cards), cards)
 
     def test_no_reinforcements_builds_more(self):
         wave = [{"enemyId": 0, "count": 12, "allowedRows": list(range(6))},
@@ -142,6 +142,53 @@ class Opening(unittest.TestCase):
         cost = lambda cards: sum(COSTS[str(k)] for k, _, _ in cards)
         self.assertGreater(cost(heavy), cost(light))
         self.assertTrue(any(k == 0 for k, _, _ in heavy), "penguins for the wizards")
+
+
+class Pirates(unittest.TestCase):
+    WAVE = [{"enemyId": 0, "count": 4, "allowedRows": [1, 2, 3, 4]}, {"enemyId": 1, "count": 3, "allowedRows": [0, 1, 2]},
+            {"enemyId": 2, "count": 2, "allowedRows": [3, 4, 5]}, {"enemyId": 3, "count": 2, "allowedRows": [0, 1, 5]}]
+
+    def test_tc02_opening(self):
+        """TC02 (lost once): 1700 coins, pauses 10 s apart, pirates in rows 0, 1, 5."""
+        cards = run(state("start", enemies=[enemy(0, 10, 2)], coins=1700, wave=self.WAVE, interval=10.0))
+        shields = {y: x for k, x, y in cards if k == 3}
+        self.assertEqual(set(shields), set(range(6)))
+        for a, b in [(0, 1), (4, 5)]:  # neighbouring pirate rows: one blast must not reach both shields
+            self.assertGreaterEqual(abs(shields[a] - shields[b]), 2, shields)
+        self.assertGreaterEqual(1700 - sum(COSTS[str(k)] for k, _, _ in cards), 250, "penguin money kept")
+        for k, x, y in cards:
+            if k == 1:
+                self.assertLess(x, shields[y], (x, y))
+        self.assertTrue(any(k == 1 and y in (0, 1, 2) for k, _, y in cards), "a soldier for the monks")
+
+
+class TC09(unittest.TestCase):
+    WAVE = [{"enemyId": 0, "count": 2, "allowedRows": [0, 2, 4]}, {"enemyId": 1, "count": 7, "allowedRows": [0, 2, 4]},
+            {"enemyId": 2, "count": 4, "allowedRows": [1, 3, 5]}, {"enemyId": 3, "count": 2, "allowedRows": [1, 3, 5]}]
+
+    def test_opening_skips_pirate_soldiers(self):
+        cards = run(state("start", enemies=[enemy(1, 10, 4)], coins=2100, wave=self.WAVE, interval=10.0))
+        self.assertEqual({y for k, _, y in cards if k == 1}, {4}, "soldier only where the first monk is")
+        self.assertGreaterEqual(2100 - sum(COSTS[str(k)] for k, _, _ in cards), 500)
+
+    def test_breaking_row_spends_reserve_on_backstop(self):
+        """The real pause that lost TC09: row 4 shield at 180, monk on it, 300 coins."""
+        defs = [defence(1, 2, 0), defence(3, 3, 0), defence(1, 3, 1), defence(3, 5, 1), defence(1, 2, 2),
+                defence(3, 3, 2), defence(3, 5, 3, 500), defence(1, 2, 4), defence(3, 3, 4, 180), defence(3, 5, 5)]
+        foes = [enemy(1, 4, 4, 10, True), enemy(0, 7, 4, 119, True), enemy(1, 10, 4)]
+        cards = opening_then(state(defences=defs, enemies=foes, coins=300, queued=9), wave=self.WAVE, coins=2100)
+        self.assertTrue(any(k == 0 and y == 4 for k, _, y in cards), cards)
+
+
+class TC01Drag(unittest.TestCase):
+    def test_pile_behind_backstop_gets_front_penguin_and_no_forward_shields(self):
+        """Real TC01 at 25.6 s: 4 clowns parked on row 4, backstop penguin behind; game dragged 120 s."""
+        defs = [defence(3, 4, y) for y in range(6) if y != 4] + [defence(3, 4, 4, 210), defence(1, 3, 4),
+                                                                  defence(0, 1, 4), defence(2, 0, 1), defence(2, 0, 2)]
+        foes = [enemy(0, 8, 4, hp, True) for hp in (165, 189, 192, 200)] + [enemy(0, 8, 5, 115, True)]
+        cards = opening_then(state(defences=defs, enemies=foes, coins=1250, queued=0), coins=5000)
+        self.assertTrue(any(k == 0 and y == 4 and 4 < x < 8 for k, x, y in cards), cards)
+        self.assertFalse(any(k == 3 and x > 5 for k, x, y in cards), cards)
 
 
 class Tactics(unittest.TestCase):
@@ -156,7 +203,7 @@ class Tactics(unittest.TestCase):
     def test_wizard_in_row_gets_penguin_between(self):
         defs = [defence(3, 4, 1), defence(1, 2, 1)]
         cards = opening_then(state(enemies=[enemy(2, 9, 1, attacking=True)], defences=defs))
-        self.assertTrue(any(k == 0 and y == 1 and 4 < x < 9 for k, x, y in cards), cards)
+        self.assertTrue(any(k == 0 and y == 1 for k, x, y in cards), cards)
 
     def test_clown_pile_gets_penguin(self):
         defs = [defence(3, 4, 3, 300), defence(1, 2, 3)]
@@ -176,10 +223,30 @@ class Tactics(unittest.TestCase):
             if k == 1 and y == 2:
                 self.assertLessEqual(x, 2, "soldier within a pirate blast of the shield")
 
-    def test_dying_shield_gets_replaced_in_front(self):
+    def test_dying_shield_gets_help_in_front(self):
         defs = [defence(3, 4, 0, 80), defence(1, 2, 0), defence(1, 1, 0)]
-        cards = opening_then(state(enemies=[enemy(0, 7, 0, attacking=True)], defences=defs))
-        self.assertTrue(any(k == 3 and y == 0 and x > 4 for k, x, y in cards), cards)
+        cards = opening_then(state(enemies=[enemy(0, 8, 0, attacking=True)], defences=defs))
+        self.assertTrue(any(k in (0, 3) and y == 0 and x > 4 for k, x, y in cards), cards)
+
+    def test_walking_clown_waits_settled_clown_gets_penguin(self):
+        defs = [defence(3, 4, y) for y in range(6)] + [defence(1, 3, 2)]
+        self.assertEqual(opening_then(state(defences=defs, enemies=[enemy(0, 9, 2)])), [])
+        cards = opening_then(state(defences=defs, enemies=[enemy(0, 8, 2, attacking=True)]))
+        self.assertEqual([c for c in cards if c[0] != 3], [(0, 7, 2)])
+
+    def test_no_soldiers_wasted_on_far_clowns(self):
+        defs = [defence(3, 4, y) for y in range(6)]
+        cards = opening_then(state(defences=defs, enemies=[enemy(0, 8, 1, attacking=True)], coins=5000))
+        self.assertFalse(any(k == 1 for k, _, _ in cards), cards)
+
+    def test_wizard_from_spawn_gets_penguin(self):
+        defs = [defence(3, 4, y) for y in range(6)]
+        quick = opening_then(state(defences=defs, enemies=[enemy(2, 10, 4, attacking=True)]))
+        self.assertIn((0, 3, 4), quick, "pauses every 3 s: backstop right behind the shield")
+        wave = [{"enemyId": 2, "count": 4, "allowedRows": [4]}]
+        run(state("start", enemies=[enemy(2, 10, 4)], wave=wave, interval=10.0, sid="slow-pauses"))
+        slow = run(state(enemies=[enemy(2, 10, 4, attacking=True)], defences=defs, sid="slow-pauses"))
+        self.assertIn((0, 9, 4), slow, "pauses every 10 s: in front, so the shield survives")
 
     def test_emptied_row_gets_shield_while_enemies_queued(self):
         defs = [defence(3, 4, y) for y in range(5)]

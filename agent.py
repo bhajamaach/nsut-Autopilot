@@ -1,25 +1,44 @@
 """Rule-based agent: no LLM, every decision comes from the rules below.
 
-Each threatened row gets a shield at SHIELD_X as the blocker and soldiers behind it.
-At every pause each row with enemies is checked, most urgent first:
+Each row enemies may use gets a shield as the blocker; rows monks may use also get a
+soldier behind it. At every pause each row with enemies is checked, most urgent first:
   1. nothing in front of the leading enemy: emergency blocker (penguin when it is close)
   2. a wizard in the row: a penguin in front of the blocker (500 kills a full wizard)
-  3. not enough damage to kill the row before the blocker falls: soldiers, then a penguin
+  3. not enough damage to kill the row before the blocker falls: a penguin for clowns and
+     wizards (soldiers barely hurt them where they stand), soldiers for the rest
   4. blocker getting weak: a fresh shield in front of it
-Rows that may still get enemies keep at least a shield. Coins are kept when not needed,
-since leftover coins and surviving defences both score.
+Rows that may still get enemies keep at least a shield, and a penguin's worth of coins is
+kept back while enemies are still to come. Spending costs little score; losing costs most.
 If anything here crashes, the starter's fallback() still places soldiers.
+
+Seen in play: clowns stand ~4 tiles in front of the blocker and wizards ~6 (snapshot
+positions), monks right at it. A soldier more than ~4 tiles from its target does little,
+so a soldier 2 behind the shield can't beat a clown's regen. A pirate's blast also hits the
+shields in the rows above and below, so near pirate rows the shields are staggered (3 / 5).
 """
 import sys
 
 PENGUIN, SOLDIER, ARCHER, SHIELD = 0, 1, 2, 3
-SHIELD_X = 4          # blocker column: soldiers at 2, 1, 0 stay out of a pirate blast at the shield
+SHIELD_X = 4          # blocker column away from pirates
 ENEMY_TYPES = {0: "EnemClown", 1: "EnemyMonk", 2: "EnemyWizard", 3: "EnemyPirate"}
 ENEMY_HP = {"EnemClown": 200, "EnemyMonk": 280, "EnemyWizard": 500, "EnemyPirate": 30}
 ENEMY_DPS = {"EnemClown": 17, "EnemyMonk": 36, "EnemyWizard": 50, "EnemyPirate": 0}
+STANDOFF = {"EnemClown": 4, "EnemyMonk": 1, "EnemyWizard": 6, "EnemyPirate": 0}  # tiles from the blocker
 REGEN = {"EnemClown": 15, "EnemyWizard": 15}
-SOLDIER_DPS = 40
+SOLDIER_DPS, SOLDIER_FAR_DPS, SOLDIER_REACH = 40, 10, 4
 PIRATE_BLAST = 200
+# strategy knobs (sim.py compares settings of these)
+OPEN_SOLDIERS = "first"  # "all" monk rows at the opening, or only the "first" enemy's row
+OPEN_ARCHERS = 0        # archers bought at the opening when the wave has clowns or wizards
+RESERVE = 250           # coins kept back while enemies are still to come
+RICH_MARGIN = 150       # spare coins (above the reserve) before acting early on parked clowns / monk rows
+MAX_SOLDIERS = 1        # soldiers per row unless its blocker is about to fall (then up to 3)
+BACKSTOP_WIZARD = True   # wizard in a row: penguin behind the shield at once, instead of in front of it
+BACKSTOP_SPARE = False   # a spare shield behind a backstop penguin, so the row stays blocked after it slides
+BACKSTOP_MAX_INTERVAL = 6  # ...only when pauses come often: after the slide the row is empty until the next one
+JIT_SHIELDS = False      # shield a row only once an enemy that may use it spawns before the next pause
+BACKSTOP_CLOWN = False   # clowns in a row: penguin behind the shield at once, instead of in front later
+CLOWN_ARCHERS = 0       # archers on the board before parked clowns are left to them instead of penguins
 
 _games = {}  # sessionID -> what the opening told us about the wave
 
@@ -61,9 +80,47 @@ class Planner:
         self.taken = {_xy(d) for d in defences}
         self.cards = []
         self.game = self._game_info()
-        queued = state["counts"]["enemiesQueued"]
+        self.queued = state["counts"]["enemiesQueued"]
         # keep enough for one emergency penguin while enemies are still to come
-        self.reserve = costs[PENGUIN] if queued > 0 and self.game["reinforce"] else 0
+        self.reserve = RESERVE if self.queued > 0 and self.game["reinforce"] else 0
+        if self.reserve and self.upcoming().count("EnemyWizard") >= 2:
+            self.reserve += costs[PENGUIN]  # two wizards may need a penguin on the same pause
+
+    def _spawn_times(self):
+        """Game time of each spawn, from the opening's spawn settings (the first is now)."""
+        spawn = self.state.get("spawnSettings") or {}
+        total = self.state["counts"].get("totalEnemiesInWave") or 0
+        try:
+            gap, rate, low = (float(spawn[k]) for k in ("interArrivalTime", "timeDecreaseRate", "minInterArrivalTime"))
+        except (KeyError, TypeError, ValueError):
+            return []
+        t, times = float(self.state.get("elapsedSeconds") or 0), []
+        for _ in range(total):
+            times.append(t)
+            t += gap
+            gap = max(low, gap - rate)
+        return times
+
+    def soon(self):
+        """Rows an enemy may enter before the pause after next is answered; None if unknown."""
+        seq, times = self.game["sequence"], self.game["spawn_times"]
+        if not JIT_SHIELDS or not seq or len(times) != len(seq) or not self.game["reinforce"]:
+            return None
+        now = float(self.state.get("elapsedSeconds") or 0)
+        horizon = now + self.game["interval"] + 2
+        rows = set()
+        for kind, t in zip(seq[len(seq) - self.queued:], times[len(seq) - self.queued:]):
+            if t <= horizon:
+                rows |= {y for y in range(6) if kind in self.game["row_types"][y]}
+        return rows
+
+    def upcoming(self):
+        """Enemy types still to spawn, when the level fixes the order."""
+        seq = self.game["sequence"]
+        return seq[len(seq) - self.queued:] if seq and self.queued else []
+
+    def rich(self, extra=0):
+        return self.coins - extra >= self.reserve + RICH_MARGIN
 
     def _game_info(self):
         sid = self.state.get("sessionID")
@@ -83,7 +140,10 @@ class Planner:
             _games[sid] = {
                 "row_types": row_types,
                 "counts": counts,
-                "pirates": counts.get("EnemyPirate", 0) > 0,
+                "pirate_rows": {y for y in range(6) if "EnemyPirate" in row_types[y]},
+                "sequence": [ENEMY_TYPES.get(k, "EnemClown") for k in
+                             (self.state.get("spawnSettings") or {}).get("spawnSequence") or []],
+                "spawn_times": self._spawn_times(),
                 "reinforce": settings.get("reinforcementsEnabled", True),
                 "interval": settings.get("reinforcementIntervalSeconds", 3.0),
             }
@@ -110,10 +170,29 @@ class Planner:
                 return x
         return None
 
-    def soldier_slots(self, anchor):
-        """Columns behind the blocker at `anchor`, nearest first, away from a pirate blast."""
-        gap = 2 if self.game["pirates"] else 1
-        return list(range(anchor - gap, -1, -1))
+    def shield_col(self, y):
+        """Blocker column. Near pirate rows, neighbours alternate 3 / 5 so one blast hits one shield."""
+        pirates = self.game["pirate_rows"]
+        if pirates & {y - 1, y, y + 1}:
+            return 3 if y % 2 == 0 else 5
+        return SHIELD_X
+
+    def blast_safe(self, x, y):
+        """Is (x, y) out of reach of a pirate blowing up at a blocker (its own row or a neighbour's)?"""
+        for p in (y - 1, y, y + 1):
+            if p not in self.game["pirate_rows"]:
+                continue
+            bx = self.shield_col(p) + 0.4  # the pirate stops just in front of the blocker
+            dy = 1.5 * abs(p - y)
+            if (1.5 * (x - bx)) ** 2 + dy ** 2 <= 2.2 ** 2:
+                return False
+        return True
+
+    def soldier_slots(self, anchor, y):
+        """Columns behind the blocker at `anchor`, nearest first, out of pirate blasts if possible."""
+        behind = list(range(anchor - 1, -1, -1))
+        safe = [x for x in behind if self.blast_safe(x, y)]
+        return safe or behind
 
     # ---- the plan ------------------------------------------------------------------
 
@@ -130,6 +209,7 @@ class Planner:
         for y, _ in rows:
             self.blocker(y)
         self.cover_empty_rows()
+        self.prepare()
         self.archers(rows)
         return self.cards
 
@@ -138,30 +218,54 @@ class Planner:
         rows = [y for y in range(6) if types[y]]
         first = sorted({_xy(e)[1] for e in self.enemies})
         rows = first + [y for y in rows if y not in first]
-        heavy = not self.game["reinforce"] or self.game["interval"] > 5
+        heavy = not self.game["reinforce"]
         if heavy:  # no pauses to react in: build the whole defence now
             self.reserve = 0
-        for y in rows:  # a blocker everywhere first; pirate rows can't be reacted to at all
-            self.place(SHIELD, SHIELD_X, y, urgent=True)
-        for y in rows:
-            if y in first or heavy or self.coins - self.costs[SOLDIER] >= self.reserve + 300:
-                self.place(SOLDIER, SHIELD_X - 2, y)
-        if not heavy:
+        soon = None if heavy else self.soon()
+        for y in rows:  # a blocker in every row an enemy may reach before we are asked again
+            if soon is None or y in soon or y in first:
+                self.place(SHIELD, self.shield_col(y), y, urgent=True)
+        # soldiers where they work: monks walk up to them (pirates blowing up on a shield count as kills)
+        melee = [y for y in rows if "EnemyMonk" in types[y]]
+        melee.sort(key=lambda y: y not in first)
+        if heavy:
+            self.heavy_opening(rows, melee)
             return
-        wizards = self.game["counts"].get("EnemyWizard", 0)
+        if OPEN_SOLDIERS == "first":
+            melee = [y for y in melee if y in first]
+        for y in melee:
+            self.place_first(SOLDIER, self.soldier_slots(self.shield_col(y), y), y)
+        if self.game["counts"].get("EnemClown", 0) + self.game["counts"].get("EnemyWizard", 0):
+            for y in self.archer_rows()[:OPEN_ARCHERS]:
+                self.place(ARCHER, 0, y)
+
+    def heavy_opening(self, rows, melee):
+        """No pauses to react in. Behind each shield a penguin waits: when the pile in front breaks
+        the shield, the penguin is hit and slides through all of it (wizards too). Soldiers behind
+        that for monks, then archers, which reach every row, with what is left."""
+        types = self.game["row_types"]
+        counts = self.game["counts"]
+
+        def backstop(y):
+            s = self.shield_col(y)
+            self.place_first(PENGUIN, [x for x in range(s - 1, -1, -1) if self.blast_safe(x, y)], y)
+
         for y in rows:
-            if wizards > 0 and "EnemyWizard" in types[y]:
-                if self.place(PENGUIN, SHIELD_X + 1, y):
-                    wizards -= 1
-        total = sum(self.game["counts"].values())
+            if "EnemyWizard" in types[y]:
+                backstop(y)
+        for y in melee:
+            self.place_first(SOLDIER, self.soldier_slots(self.shield_col(y), y), y)
         for y in rows:
-            if total / max(len(rows), 1) >= 2 and types[y] - {"EnemyPirate"}:
-                self.place(SOLDIER, SHIELD_X - 3, y)
-        archers = min(3, total // 6)
-        for y in reversed(rows):
-            if archers > 0 and self.coins - self.costs[ARCHER] >= 0.15 * self.state["budget"]["remaining"]:
-                if self.place(ARCHER, 0, y):
-                    archers -= 1
+            if "EnemClown" in types[y] and "EnemyWizard" not in types[y]:
+                backstop(y)
+        total = sum(counts.values())
+        for y in melee:  # a second soldier where monks will come often
+            if counts.get("EnemyMonk", 0) / max(len(melee), 1) >= 2:
+                self.place_first(SOLDIER, self.soldier_slots(self.shield_col(y), y), y)
+        archers = min(4, max(1, total // 4))
+        for y in self.archer_rows():
+            if archers > 0 and self.place(ARCHER, 0, y):
+                archers -= 1
 
     def row_state(self, y):
         foes = sorted((e for e in self.enemies if _xy(e)[1] == y), key=lambda e: e["position"]["x"])
@@ -195,9 +299,9 @@ class Planner:
             if x is not None:
                 self.place_first(SOLDIER, range(x - 1, -1, -1), y, urgent=True)
         else:
-            x = self.place_first(SHIELD, range(min(SHIELD_X, front - 1), -1, -1), y, urgent=True)
-            if x is not None:
-                self.place_first(SOLDIER, self.soldier_slots(x) or range(x - 1, -1, -1), y, urgent=True)
+            x = self.place_first(SHIELD, range(min(self.shield_col(y), front - 1), -1, -1), y, urgent=True)
+            if x is not None and lead == "EnemyMonk":
+                self.place_first(SOLDIER, self.soldier_slots(x, y), y, urgent=True)
 
     def wizard(self, y):
         foes, front, guards = self.row_state(y)
@@ -206,48 +310,104 @@ class Planner:
         if any(d["type"] == "defencePenguin" for d in guards):
             return
         first = max(_xy(d)[0] for d in guards)
+        if BACKSTOP_WIZARD and self.game["interval"] <= BACKSTOP_MAX_INTERVAL and self.wall_time(foes, guards) > self.game["interval"] + 3 and self.backstop(y, first, True):
+            return
         self.place_first(PENGUIN, range(front - 1, first, -1), y, urgent=True)
 
     def firepower(self, y):
         foes, front, guards = self.row_state(y)
         if not guards:
             return
+        if self.holds(foes, guards):
+            return
         shields = [d for d in guards if d["type"] == "defenceShield"]
         anchor = max(_xy(d)[0] for d in (shields or guards))
+        first = max(_xy(d)[0] for d in guards)
+        has_penguin = bool(working_penguins(foes, guards))
+        regen = [e for e in foes if e["type"] in REGEN]
+        piled = sum(e.get("isAttacking", False) for e in regen)
+        # the blocker falls before the next pause: this row may spend the emergency reserve
+        urgent = self.wall_time(foes, guards) < self.game["interval"] + 3
+        # clowns and wizards: one penguin clears the whole pile, so let a pile build up on the
+        # shield (a clown needs ~40 s to break one) unless it is in danger or the wave is over
+        if BACKSTOP_CLOWN and regen and not has_penguin and self.backstop(y, first, urgent):
+            guards = self.row_state(y)[2]
+            has_penguin = True
+        archers = sum(d["type"] == "defenceArcher" for d in self.defences if d["health"] > 0)
+        if piled and not urgent and not has_penguin and archers < CLOWN_ARCHERS and \
+                not any(e["type"] == "EnemyWizard" for e in regen):
+            for x, ay in [(0, r) for r in self.archer_rows()]:
+                if self.place(ARCHER, x, ay):
+                    return  # the archers will grind the parked clowns down
+        if archers >= CLOWN_ARCHERS > 0 and not urgent and not any(e["type"] == "EnemyWizard" for e in regen):
+            piled = 0
+        if regen and not has_penguin and (urgent or piled >= 2 or (piled and (self.queued == 0 or self.rich(250)))):
+            if self.penguin(y, front, first, urgent):
+                guards = self.row_state(y)[2]
+                has_penguin = True
+        if regen and not any(e["type"] == "EnemyMonk" for e in foes) and (has_penguin or not urgent):
+            return  # far soldiers can't out-damage regen: leave it to the penguin
         for _ in range(3):
             if self.holds(foes, guards):
                 return
             soldiers = sum(d["type"] == "defenceSolider" for d in guards)
-            urgent = soldiers == 0 and any(e["type"] != "EnemyPirate" for e in foes)
-            if soldiers < 3 and self.place_first(SOLDIER, self.soldier_slots(anchor), y, urgent) is not None:
+            need = urgent or (soldiers == 0 and any(e["type"] == "EnemyMonk" for e in foes))
+            cap = 3 if urgent else MAX_SOLDIERS
+            if soldiers < cap and self.place_first(SOLDIER, self.soldier_slots(anchor, y), y, need) is not None:
                 guards = self.row_state(y)[2]
                 continue
             break
-        if not self.holds(foes, guards) and not any(d["type"] == "defencePenguin" for d in guards):
-            first = max(_xy(d)[0] for d in guards)
-            self.place_first(PENGUIN, range(front - 1, first, -1), y)
+        if urgent and not has_penguin and not self.holds(foes, guards):
+            self.penguin(y, front, first, urgent=True)
+
+    def backstop(self, y, first, urgent=False):
+        """A penguin right behind the blocker: when the pile breaks it, the penguin is hit next."""
+        behind = [x for x in range(first - 1, -1, -1) if self.blast_safe(x, y)]
+        x = self.place_first(PENGUIN, behind, y, urgent)
+        if x is None:
+            return False
+        if BACKSTOP_SPARE and not any(d["type"] == "defenceShield" and _xy(d)[1] == y and _xy(d)[0] < x
+                                      for d in self.defences if d["health"] > 0):
+            self.place_first(SHIELD, range(x - 1, -1, -1), y)  # keeps the row blocked after the slide
+        return True
+
+    def penguin(self, y, front, first, urgent):
+        """In front of the blocker if there's room, else behind it as a backstop: when the line
+        breaks the enemies hit it and it slides through the whole row."""
+        if self.place_first(PENGUIN, range(front - 1, first, -1), y, urgent) is not None:
+            return True
+        behind = [x for x in range(first - 1, -1, -1) if self.blast_safe(x, y)]  # a blast would set it off
+        return urgent and self.place_first(PENGUIN, behind, y, urgent) is not None
+
+    def wall_time(self, foes, guards):
+        """Seconds until the shields in front of the soldiers are broken."""
+        incoming = sum(ENEMY_DPS.get(e["type"], 30) for e in foes)
+        blasts = sum(e["type"] == "EnemyPirate" for e in foes)
+        wall = sum(d["health"] for d in guards if d["type"] == "defenceShield") - PIRATE_BLAST * blasts
+        return max(wall, 0) / incoming if incoming else (99 if wall > 0 else 0)
 
     def holds(self, foes, guards):
         """Can the soldiers kill the row before the blockers in front of them fall?"""
-        dps = SOLDIER_DPS * sum(d["type"] == "defenceSolider" for d in guards)
-        if any(d["type"] == "defencePenguin" for d in guards):
+        if working_penguins(foes, guards):
             foes = [e for e in foes if e["health"] > 500]  # the slide will finish the rest
         if not foes:
             return True
-        ttk, incoming, blasts = 0.0, 0.0, 0
+        soldiers = [_xy(d)[0] for d in guards if d["type"] == "defenceSolider"]
+        front_guard = max(_xy(d)[0] for d in guards)
+        ttk, pirates_only = 0.0, True
         for e in foes:
             if e["type"] == "EnemyPirate":
-                blasts += 1
                 continue
+            pirates_only = False
+            stand = min(_xy(e)[0], front_guard + STANDOFF.get(e["type"], 1))  # where it will stop
+            dps = sum(SOLDIER_DPS if stand - s <= SOLDIER_REACH else SOLDIER_FAR_DPS for s in soldiers)
             net = dps - REGEN.get(e["type"], 0)
             if net <= 0:
                 return False
             ttk += e["health"] / net
-            incoming += ENEMY_DPS.get(e["type"], 30)
-        wall = sum(d["health"] for d in guards if d["type"] == "defenceShield") - PIRATE_BLAST * blasts
-        if incoming == 0:  # pirates only: the shield takes the blasts, a soldier gets the kills
-            return dps > 0 and wall > 0
-        return ttk * 1.2 + 1 < max(wall, 0) / incoming
+        if pirates_only:  # they blow up on the shield, which counts as a kill
+            return self.wall_time(foes, guards) > 0
+        return ttk * 1.2 + 1 < self.wall_time(foes, guards)
 
     def blocker(self, y):
         foes, front, guards = self.row_state(y)
@@ -259,17 +419,41 @@ class Planner:
         weak = first["type"] != "defenceShield" or first["health"] < incoming * 6 + PIRATE_BLAST * blasts
         if weak and first["type"] != "defencePenguin":
             fx = _xy(first)[0]
-            self.place_first(SHIELD, range(min(front - 1, fx + 2), fx, -1), y)
+            # never further forward than one past the usual column: a blocker far forward keeps
+            # the enemies out of the soldiers' reach and the game drags on
+            self.place_first(SHIELD, range(min(front - 1, fx + 2, self.shield_col(y) + 1), fx, -1), y)
+
+    def prepare(self):
+        """With coins to spare, give rows monks may use a soldier before a monk arrives."""
+        if self.state["phase"] == "start" or self.queued == 0:
+            return
+        upcoming = self.upcoming()
+        if upcoming and "EnemyMonk" not in upcoming:
+            return
+        for y in range(6):
+            if "EnemyMonk" not in self.game["row_types"][y] or not self.rich(self.costs[SOLDIER]):
+                continue
+            row = [d for d in self.defences if d["health"] > 0 and _xy(d)[1] == y]
+            shields = [_xy(d)[0] for d in row if d["type"] == "defenceShield"]
+            if shields and not any(d["type"] == "defenceSolider" for d in row):
+                self.place_first(SOLDIER, self.soldier_slots(max(shields), y), y)
 
     def cover_empty_rows(self):
         if self.state["counts"]["enemiesQueued"] <= 0:
             return
+        soon = self.soon()
         for y in range(6):
-            if not self.game["row_types"][y]:
+            if not self.game["row_types"][y] or (soon is not None and y not in soon):
                 continue
             if any(_xy(d)[1] == y for d in self.defences if d["health"] > 0):
                 continue
-            self.place(SHIELD, SHIELD_X, y, urgent="EnemyPirate" in self.game["row_types"][y])
+            self.place(SHIELD, self.shield_col(y), y, urgent="EnemyPirate" in self.game["row_types"][y])
+
+    def archer_rows(self):
+        """Archers sit at x=0, best in rows enemies can't use, else behind the most defences."""
+        types = self.game["row_types"]
+        return sorted(range(6), key=lambda y: (bool(types[y]), "EnemyPirate" in types[y],
+                                               -sum(_xy(d)[1] == y for d in self.defences)))
 
     def archers(self, rows):
         """Spare coins on a crowded board buy archers: they hit any row, so they help the weakest."""
@@ -283,6 +467,16 @@ class Planner:
                 return
             if self.place(ARCHER, 0, y):
                 have += 1
+
+
+def working_penguins(foes, guards):
+    """Penguins that will slide soon: in front of every other defence, or a backstop behind a shield
+    a wizard is beaming (~14 s). Clowns take ~40 s per shield, so behind one a backstop just waits."""
+    penguins = [d for d in guards if d["type"] == "defencePenguin"]
+    if any(e["type"] == "EnemyWizard" for e in foes):
+        return penguins
+    others = [_xy(d)[0] for d in guards if d["type"] != "defencePenguin"]
+    return [d for d in penguins if _xy(d)[0] > max(others, default=-1)]
 
 
 _DEF_TYPE = {PENGUIN: "defencePenguin", SOLDIER: "defenceSolider", ARCHER: "defenceArcher", SHIELD: "defenceShield"}

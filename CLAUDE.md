@@ -38,3 +38,13 @@ The starter's LLM prompt contains wrong facts (penguin "can ram again", archer "
 - Pirate row: a cheap far-forward shield with nothing within 2 tiles as blast bait. Never let a pirate's blast reach a penguin.
 - Don't overspend: leftover coins and surviving defences both score. Add more on pauses from kill income.
 Order of work: PLAY TC01 to check the pipeline, PUBLISH PUBLIC the starter as a baseline, write the rule agent, then test on all public cases.
+
+## Findings from real games (17 Oct)
+- Soldiers barely hurt clowns or wizards standing off in front of a shield (clowns stop ~4 tiles in front of the first defence, wizards ~6, by snapshot x); they do kill monks, which walk up to it. Penguins clear piles (1500-2000 dmg per use) and are not counted as destroyed.
+- A pirate's blast also hits shields in the neighbouring rows at the same column.
+- Real results: TC01 won 95.3 (twice). TC02 (1700 coins, 10 s pauses) and TC09 (2100 coins, 10 s pauses) lost with the first two versions: coins ran out.
+- Economy costs ~0.08 pts per 100 coins spent on TC01, so winning is worth far more than saving.
+
+## Tools
+- `.venv/bin/python -m unittest test_agent` : offline tests (fuzz + tactical cases).
+- `.venv/bin/python sim.py 40 [agent file]` : rough simulator, win counts per case. Approximate, confirm with PLAY.
