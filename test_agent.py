@@ -29,12 +29,12 @@ def defence(kind, x, y, health=None):
 
 
 def state(phase="pause", enemies=(), defences=(), coins=3000, queued=5, wave=None, reinforce=True,
-          interval=3.0, sid=None):
+          interval=3.0, sid=None, elapsed=None):
     if sid is None:
         _sid[0] += 1
         sid = f"s{_sid[0]}"
     s = {
-        "phase": phase, "timeBudgetSeconds": 15, "teamID": "0060", "sessionID": sid, "elapsedSeconds": 5.0,
+        "phase": phase, "timeBudgetSeconds": 15, "teamID": "0060", "sessionID": sid, "elapsedSeconds": 0.3 if phase == "start" else 4.5 if elapsed is None else elapsed,
         "counts": {"activeDefenceCount": len(defences), "activeEnemyCount": len(enemies),
                    "enemiesQueued": queued, "totalEnemiesInWave": queued + len(enemies)},
         "defences": list(defences), "enemies": list(enemies),
@@ -59,7 +59,8 @@ def run(s):
 
 
 def opening_then(pause, wave=None, coins=3000, reinforce=True):
-    """Play the opening on an empty board so the agent learns the wave, then the given pause."""
+    """Play the opening, then the given pause. Like the real SDK (a fresh process per call), the
+    pause doesn't see what the opening learnt: it must work from the board."""
     sid = f"g{random.random()}"
     run(state("start", enemies=[enemy(0, 10, 0)], coins=coins, wave=wave, reinforce=reinforce, sid=sid))
     pause["sessionID"] = sid
@@ -176,7 +177,8 @@ class TC09(unittest.TestCase):
         defs = [defence(1, 2, 0), defence(3, 3, 0), defence(1, 3, 1), defence(3, 5, 1), defence(1, 2, 2),
                 defence(3, 3, 2), defence(3, 5, 3, 500), defence(1, 2, 4), defence(3, 3, 4, 180), defence(3, 5, 5)]
         foes = [enemy(1, 4, 4, 10, True), enemy(0, 7, 4, 119, True), enemy(1, 10, 4)]
-        cards = opening_then(state(defences=defs, enemies=foes, coins=300, queued=9), wave=self.WAVE, coins=2100)
+        cards = opening_then(state(defences=defs, enemies=foes, coins=300, queued=9, elapsed=22.8),
+                             wave=self.WAVE, coins=2100)
         self.assertTrue(any(k == 0 and y == 4 for k, _, y in cards), cards)
 
 
@@ -189,6 +191,16 @@ class TC01Drag(unittest.TestCase):
         cards = opening_then(state(defences=defs, enemies=foes, coins=1250, queued=0), coins=5000)
         self.assertTrue(any(k == 0 and y == 4 and 4 < x < 8 for k, x, y in cards), cards)
         self.assertFalse(any(k == 3 and x > 5 for k, x, y in cards), cards)
+
+
+class TC02Leak(unittest.TestCase):
+    def test_row_about_to_leak_beats_a_wizard_at_spawn(self):
+        """Real TC02 at 45.2 s, 300 coins: monk on a 20 HP shield (no soldier) vs a wizard at x=10."""
+        defs = [defence(1, 1, 0), defence(3, 3, 0, 340), defence(3, 5, 1, 20), defence(1, 1, 2), defence(3, 3, 2, 430),
+                defence(3, 4, 3, 100), defence(3, 3, 4, 30), defence(3, 5, 5, 445)]
+        foes = [enemy(1, 6, 1, 280, True), enemy(0, 7, 2, 100), enemy(2, 10, 5, 500, True)]
+        cards = run(state(defences=defs, enemies=foes, coins=300, queued=0, elapsed=45.2))
+        self.assertEqual([(k, y) for k, _, y in cards], [(0, 1)], cards)
 
 
 class Tactics(unittest.TestCase):
@@ -218,7 +230,7 @@ class Tactics(unittest.TestCase):
     def test_pirate_wave_keeps_soldiers_out_of_blast(self):
         wave = [{"enemyId": 3, "count": 6, "allowedRows": [2]}, {"enemyId": 1, "count": 4, "allowedRows": [2]}]
         foes = [enemy(1, 7, 2), enemy(1, 8, 2), enemy(3, 9, 2)]
-        cards = opening_then(state(enemies=foes, defences=[defence(3, 4, 2)]), wave=wave)
+        cards = opening_then(state(enemies=foes, defences=[defence(3, 3, 2)]), wave=wave)  # opening staggers it
         for k, x, y in cards:
             if k == 1 and y == 2:
                 self.assertLessEqual(x, 2, "soldier within a pirate blast of the shield")
@@ -244,8 +256,7 @@ class Tactics(unittest.TestCase):
         quick = opening_then(state(defences=defs, enemies=[enemy(2, 10, 4, attacking=True)]))
         self.assertIn((0, 3, 4), quick, "pauses every 3 s: backstop right behind the shield")
         wave = [{"enemyId": 2, "count": 4, "allowedRows": [4]}]
-        run(state("start", enemies=[enemy(2, 10, 4)], wave=wave, interval=10.0, sid="slow-pauses"))
-        slow = run(state(enemies=[enemy(2, 10, 4, attacking=True)], defences=defs, sid="slow-pauses"))
+        slow = run(state(enemies=[enemy(2, 10, 4, attacking=True)], defences=defs, elapsed=11.5))
         self.assertIn((0, 9, 4), slow, "pauses every 10 s: in front, so the shield survives")
 
     def test_emptied_row_gets_shield_while_enemies_queued(self):

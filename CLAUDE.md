@@ -48,3 +48,10 @@ Order of work: PLAY TC01 to check the pipeline, PUBLISH PUBLIC the starter as a 
 ## Tools
 - `.venv/bin/python -m unittest test_agent` : offline tests (fuzz + tactical cases).
 - `.venv/bin/python sim.py 40 [agent file]` : rough simulator, win counts per case. Approximate, confirm with PLAY.
+
+## Score formulas (fitted from 4 real wins; matches the backend's breakdown to ~0.1)
+- economy = 15 * (1 - spent / (3 * matchBudget))  -> spending EVERYTHING only costs 10 pts; 100 coins ~ 0.08 pts. Spend freely if it buys a win.
+- survival = 25 * (1 - destroyed / placed)  (a penguin that slides away does not count as destroyed; dead shields do)
+- speed ~ 10 * (1 - seconds / 235)
+- kills = 25 * killed / total. A loss keeps only kills.
+- Public leaderboard 17 Oct 14:37: #1 370.84 (avg 92.7 per case, i.e. wins all 4 with almost no losses); top 6 all >= 356. Hidden-case board is the final one.

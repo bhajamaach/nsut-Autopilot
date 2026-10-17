@@ -77,6 +77,8 @@ class Game:
         return s
 
     def ask(self, phase):
+        if hasattr(self.agent, "_games"):
+            self.agent._games.clear()  # the real SDK runs every call in a fresh process
         with redirect_stderr(io.StringIO()):
             cards = self.agent.get_reinforcements(self.snapshot(phase))
         seen = set()
@@ -161,7 +163,7 @@ class Game:
                 row = [e for e in self.foes if e["y"] == d["y"] and e["x"] >= d["x"] - 0.5]
                 if row:
                     e = min(row, key=lambda e: e["x"])
-                    self.hurt_enemy(e, (40 if e["x"] - d["x"] <= 4.4 else 10) * DT)
+                    self.hurt_enemy(e, 40 * DT)  # real games: soldiers hit targets 6-7 tiles away at full rate
             elif d["k"] == 2 and self.foes:
                 low = min(e["y"] for e in self.foes)
                 e = min((e for e in self.foes if e["y"] == low), key=lambda e: e["x"])
@@ -171,7 +173,7 @@ class Game:
     def play(self):
         self.spawn()
         self.ask("start")
-        next_pause = self.c["interval"] or 1e9
+        next_pause = (self.c["interval"] + 1.2) if self.c["interval"] else 1e9
         while True:
             if self.queue and self.t >= self.next_spawn:
                 self.spawn()
@@ -182,7 +184,7 @@ class Game:
                 return True
             if self.t >= next_pause:
                 self.ask("pause")
-                next_pause = self.t + self.c["interval"]
+                next_pause = self.t + self.c["interval"] + 1.2  # real pauses drift ~1.2 s each
             if self.t > 600:
                 return False
 
