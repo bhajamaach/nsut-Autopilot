@@ -1,0 +1,19 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+
+# SDK run logs: each machine keeps its own (the organisers may ask winners for them)
+autopilot-runs/
+
+# Secrets, in case anyone saves a login locally
+.env
+*.env
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
